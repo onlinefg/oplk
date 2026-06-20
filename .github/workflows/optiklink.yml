@@ -1,0 +1,163 @@
+name: OptikLink 每日自动登录
+
+on:
+  schedule:
+    - cron: "0 1 * * *"   # 每天 UTC 01:00（北京时间 09:00）
+  workflow_dispatch:
+    inputs:
+      enable_recording:
+        description: '是否开启录屏（true=录屏 / false=不录屏）'
+        required: false
+        default: 'false'
+        type: choice
+        options:
+          - 'false'
+          - 'true'
+
+jobs:
+  auto-login:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 安装 Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: 安装系统依赖
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq \
+            xvfb x11-utils curl unzip \
+            fonts-noto-cjk \
+            libnss3 libatk1.0-0 libatk-bridge2.0-0 libcups2 \
+            libdrm2 libxkbcommon0 libxcomposite1 libxdamage1 \
+            libxfixes3 libxrandr2 libgbm1 \
+            libasound2t64 || sudo apt-get install -y -qq libasound2
+          sudo apt-get install -y -qq ffmpeg \
+            || echo "ffmpeg 安装失败，录屏将不可用"
+
+      - name: 安装 Python 依赖
+        run: |
+          pip install "cloakbrowser[geoip]"
+          pip install Pillow
+          python -c "from cloakbrowser import ensure_binary; ensure_binary()"
+
+      - name: 下载并启动 Xray 代理
+        env:
+          V2RAY_CONFIG: ${{ secrets.V2RAY_CONFIG }}
+        run: |
+          curl -sL https://github.com/XTLS/Xray-core/releases/download/v25.5.16/Xray-linux-64.zip -o xray.zip
+          unzip xray.zip && chmod +x xray
+          echo "$V2RAY_CONFIG" > config.json
+          ./xray run -c config.json &
+          sleep 5
+          echo "=== 直连 IP ==="
+          curl -s --max-time 5 ifconfig.me || echo "获取失败"
+          echo ""
+          echo "=== 代理 IP（SOCKS5 10808）==="
+          curl -s --max-time 5 --socks5 127.0.0.1:10808 ifconfig.me || echo "获取失败"
+          echo ""
+
+      - name: 启动 Xvfb 并执行自动登录脚本
+        env:
+          DISCORD_TOKEN:       ${{ secrets.DISCORD_TOKEN }}
+          WXPUSHER_TOKEN:      ${{ secrets.WXPUSHER_TOKEN }}
+          WXPUSHER_UID:        ${{ secrets.WXPUSHER_UID }}
+          EXPIRE_DATE:         ${{ secrets.EXPIRE_DATE }}
+          PROXY_URL:           "socks5://127.0.0.1:10808"
+          # 定时触发时 input 为空，默认不录屏
+          ENABLE_SCREENRECORD: ${{ github.event.inputs.enable_recording || 'false' }}
+          DISPLAY:             ":99"
+          LIBGL_ALWAYS_SOFTWARE: "1"
+          GALLIUM_DRIVER:      "llvmpipe"
+        run: |
+          # 启动 Xvfb
+          Xvfb :99 -screen 0 1280x754x24 +extension RANDR &  # 高度须为偶数，与 VIEWPORT_H 保持一致
+          XVFB_PID=$!
+          echo "等待 Xvfb :99 就绪..."
+          if command -v xdpyinfo > /dev/null 2>&1; then
+            for i in $(seq 1 15); do
+              if DISPLAY=:99 xdpyinfo > /dev/null 2>&1; then
+                echo "✅ Xvfb 就绪（第 ${i} 次检测）"
+                break
+              fi
+              if [ "$i" -eq 15 ]; then
+                echo "❌ Xvfb 15 次检测仍未就绪，终止"
+                exit 1
+              fi
+              echo "  第 ${i} 次检测未就绪，等待 1s..."
+              sleep 1
+            done
+          else
+            echo "xdpyinfo 不可用，直接等待 3s..."
+            sleep 3
+            echo "✅ Xvfb 等待完成"
+          fi
+
+          # 执行登录脚本
+          timeout 300 python optiklink_cloakbrowser.py || echo "脚本退出码: $?"
+
+          echo "=== 截图目录 ==="
+          ls -la ./screenshots/ || echo "无截图"
+
+          # 清理 Xvfb
+          kill $XVFB_PID 2>/dev/null || true
+
+      - name: 上传截图
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: screenshots
+          path: ./screenshots/*.png
+          if-no-files-found: ignore
+          retention-days: 3
+
+      - name: 上传录屏（仅录屏开启时）
+        if: always() && github.event.inputs.enable_recording == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: recordings
+          path: |
+            ./recordings/*.gif
+            ./recordings/*.mp4
+          if-no-files-found: ignore
+          retention-days: 3
+
+  cleanup-old-runs:
+    runs-on: ubuntu-latest
+    needs: auto-login
+    if: always()
+    permissions:
+      actions: write
+    steps:
+      - name: 删除多余的 workflow run（保留最新 2 条）
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const KEEP = 2;
+            const workflowName = "OptikLink 每日自动登录";
+            const workflows = await github.rest.actions.listRepoWorkflows({
+              owner: context.repo.owner,
+              repo:  context.repo.repo,
+            });
+            const wf = workflows.data.workflows.find(w => w.name === workflowName);
+            if (!wf) { console.log("未找到 workflow，跳过清理"); return; }
+            const runs = await github.paginate(
+              github.rest.actions.listWorkflowRuns,
+              { owner: context.repo.owner, repo: context.repo.repo, workflow_id: wf.id, per_page: 100 }
+            );
+            const toDelete = runs.slice(KEEP);
+            console.log(`共 ${runs.length} 条 run，保留 ${KEEP} 条，删除 ${toDelete.length} 条`);
+            for (const run of toDelete) {
+              await github.rest.actions.deleteWorkflowRun({
+                owner: context.repo.owner, repo: context.repo.repo, run_id: run.id,
+              });
+              console.log(`已删除 run #${run.run_number} (id=${run.id})`);
+            }
