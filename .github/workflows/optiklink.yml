@@ -2,7 +2,7 @@ name: OptikLink 每日自动登录
 
 on:
   schedule:
-    - cron: "0 1 * * *"   # 每天 UTC 01:00（北京时间 09:00）
+    - cron: "0 1 */5 * *"  # 每5天 UTC 01:00 (北京时间 09:00) 运行一次
   workflow_dispatch:
     inputs:
       enable_recording:
