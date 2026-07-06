@@ -81,6 +81,7 @@ PROXY_URL            = os.environ.get("PROXY_URL", "socks5://127.0.0.1:10808")
 ENABLE_SCREENRECORD  = os.environ.get("ENABLE_SCREENRECORD",  "false").lower() == "true"
 PANEL_USERNAME       = os.environ.get("PANEL_USERNAME", "")
 PANEL_PASSWORD       = os.environ.get("PANEL_PASSWORD", "")
+PANEL_REMEMBER_COOKIE = os.environ.get("PANEL_REMEMBER_COOKIE", "")
 
 # v4.8: 新增 —— 登录后自动检测服务器状态，OFFLINE 则自动 START
 # 支持多个服务器 ID，逗号分隔，例如 "90a93db8,abcd1234"
@@ -798,9 +799,47 @@ def get_panel_credentials(page):
 
 
 def login_control_panel(page) -> bool:
-    """打开 control.optiklink.net/auth/login 登录表单，用面板专用账号密码登录"""
+    """登录控制面板。
+    优先策略：注入 remember_me cookie 直接免登录（绕过 reCAPTCHA）。
+    兜底策略：账号密码 + reCAPTCHA token 表单登录。
+    """
     log.info("[G0] 登录控制面板 (control.optiklink.net)...")
 
+    # ── 策略一：注入 remember_me cookie，直接免登录 ──
+    if PANEL_REMEMBER_COOKIE:
+        log.info("[G0-cookie] 尝试注入 remember_me cookie...")
+        try:
+            # 先访问域名建立上下文，再添加 cookie
+            page.goto("https://control.optiklink.net/", timeout=20000, wait_until="domcontentloaded")
+        except Exception:
+            pass
+
+        # 找到 remember_web_ cookie 的名字（从响应里固定的那个长名字）
+        REMEMBER_COOKIE_NAME = "remember_web_59ba36addc2b2f9401580f014c7f58ea4e30989d"
+        try:
+            page.context.add_cookies([{
+                "name":   REMEMBER_COOKIE_NAME,
+                "value":  PANEL_REMEMBER_COOKIE,
+                "domain": "control.optiklink.net",
+                "path":   "/",
+                "httpOnly": True,
+                "secure": True,
+                "sameSite": "Lax",
+            }])
+            log.info("[G0-cookie] cookie 已注入，验证登录态...")
+            page.goto("https://control.optiklink.net/", timeout=20000, wait_until="domcontentloaded")
+            page.wait_for_timeout(2000)
+            current = page.url.lower()
+            if "control.optiklink.net" in current and "/auth/login" not in current:
+                log.info(f"✅ cookie 免登录成功: {page.url}")
+                take_screenshot(page, "05b_control_cookie_login_ok")
+                return True
+            else:
+                log.warning(f"cookie 免登录失败（当前URL: {page.url}），降级到账号密码登录")
+        except Exception as e:
+            log.warning(f"cookie 注入异常: {e}，降级到账号密码登录")
+
+    # ── 策略二：账号密码 + reCAPTCHA 表单登录（兜底）──
     creds = get_panel_credentials(page)
 
     try:
@@ -872,6 +911,52 @@ def login_control_panel(page) -> bool:
 
     take_screenshot(page, "05c_login_form_filled")
 
+    # 面板登录页有 reCAPTCHA（invisible/v3），直接点按钮会被静默拒绝
+    # 解法：等 grecaptcha 加载完成后，手动执行 execute() 拿 token，
+    # 再注入到隐藏的 g-recaptcha-response 字段，最后再提交表单
+    RECAPTCHA_SITE_KEY = "6Lc-KlcsAAAAAOeYsd-aO8MZSf5nsNpZSIEt4k0H"
+    log.info("等待 reCAPTCHA 加载并获取 token...")
+    recaptcha_token = None
+    try:
+        # 等待 grecaptcha 对象可用（最多15s）
+        page.wait_for_function("typeof grecaptcha !== 'undefined' && typeof grecaptcha.execute === 'function'", timeout=15000)
+        # 执行 grecaptcha.execute 获取 token
+        recaptcha_token = page.evaluate(f"""
+            () => new Promise((resolve, reject) => {{
+                grecaptcha.ready(() => {{
+                    grecaptcha.execute('{RECAPTCHA_SITE_KEY}', {{action: 'login'}})
+                        .then(resolve)
+                        .catch(reject);
+                }});
+            }})
+        """)
+        log.info(f"✅ reCAPTCHA token 已获取，长度: {len(recaptcha_token) if recaptcha_token else 0}")
+    except Exception as e:
+        log.warning(f"reCAPTCHA token 获取失败（继续尝试提交）: {e}")
+
+    # 将 token 注入隐藏的 g-recaptcha-response 字段（表单提交时会带上）
+    if recaptcha_token:
+        try:
+            page.evaluate(f"""
+                (token) => {{
+                    // 注入到所有可能的 recaptcha response 字段
+                    ['g-recaptcha-response', 'g-recaptcha-response-100000'].forEach(id => {{
+                        let el = document.getElementById(id);
+                        if (!el) {{
+                            el = document.createElement('textarea');
+                            el.name = id;
+                            el.id = id;
+                            el.style.display = 'none';
+                            document.querySelector('form')?.appendChild(el);
+                        }}
+                        el.value = token;
+                    }});
+                }}
+            """, recaptcha_token)
+            log.info("reCAPTCHA token 已注入表单")
+        except Exception as e:
+            log.warning(f"注入 recaptcha token 失败: {e}")
+
     submitted = False
     for sel in [
         'button[type="submit"]',
@@ -891,7 +976,6 @@ def login_control_panel(page) -> bool:
             continue
 
     if not submitted:
-        # 兜底：直接在密码框回车提交
         try:
             page.locator('input[type="password"]').first.press("Enter")
             submitted = True
