@@ -71,6 +71,8 @@ jobs:
           WXPUSHER_TOKEN:      ${{ secrets.WXPUSHER_TOKEN }}
           WXPUSHER_UID:        ${{ secrets.WXPUSHER_UID }}
           EXPIRE_DATE:         ${{ secrets.EXPIRE_DATE }}
+          # 服务器 ID，逗号分隔（从 control.optiklink.net/server/{ID} 中获取），完全从 Secrets 读取
+          SERVER_IDS:          ${{ secrets.SERVER_IDS }}
           PROXY_URL:           "socks5://127.0.0.1:10808"
           # 定时触发时 input 为空，默认不录屏
           ENABLE_SCREENRECORD: ${{ github.event.inputs.enable_recording || 'false' }}
