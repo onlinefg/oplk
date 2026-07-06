@@ -997,10 +997,117 @@ def login_control_panel(page) -> bool:
 # ─────────────────────────────────────────────────────────────
 # v4.8: 检测服务器状态，OFFLINE 则自动点击 START
 # ─────────────────────────────────────────────────────────────
+def _read_server_status_js(page) -> str:
+    """
+    用 JS 精确读取 Pterodactyl 面板的服务器状态指示器文字。
+    先滚动到页面底部让状态区域进入视口，再从已知的状态徽标元素里读文字。
+    返回大写状态字符串，如 'ONLINE' / 'OFFLINE' / 'STARTING' / 'STOPPING'，
+    读不到则返回空字符串。
+    """
+    # 先滚动到底部，确保状态区域可见（Pterodactyl 面板状态在页面下方）
+    try:
+        page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+        page.wait_for_timeout(500)
+    except Exception:
+        pass
+
+    status = page.evaluate("""() => {
+        // Pterodactyl / Wings 面板状态徽标的常见 CSS 类名
+        const selectors = [
+            // 新版 Pterodactyl 状态 pill
+            '[class*="StatusIndicator"]',
+            '[class*="status-indicator"]',
+            '[class*="ServerStatus"]',
+            '[class*="server-status"]',
+            // 通用：包含状态关键字的 span/div（精确匹配，排除导航/按钮区域）
+            'span[class*="text-"][class*="status"]',
+            'div[class*="text-"][class*="status"]',
+            // 兜底：查找包含状态关键字且可见的小型徽标元素
+        ];
+
+        const keywords = ['OFFLINE', 'ONLINE', 'STARTING', 'STOPPING', 'RUNNING'];
+
+        // 方法1：从已知选择器里找
+        for (const sel of selectors) {
+            for (const el of document.querySelectorAll(sel)) {
+                const t = (el.innerText || el.textContent || '').trim().toUpperCase();
+                for (const kw of keywords) {
+                    if (t === kw || t.startsWith(kw)) return kw;
+                }
+            }
+        }
+
+        // 方法2：遍历所有小型文字元素（span/div/p），精确匹配状态关键字
+        // 避免匹配到按钮文字（START/STOP 等）
+        for (const el of document.querySelectorAll('span, p, small, [class*="badge"], [class*="pill"], [class*="tag"], [class*="chip"]')) {
+            const t = (el.innerText || el.textContent || '').trim().toUpperCase();
+            // 精确匹配：文字本身就是状态词，或状态词后接空格
+            for (const kw of keywords) {
+                if (t === kw) return kw;
+            }
+        }
+
+        // 方法3：读取页面右上角/顶部状态区域（Pterodactyl 把状态放在 console header 里）
+        // 找 class 包含 "Console" 或 "console" 的容器下面的状态文字
+        for (const container of document.querySelectorAll('[class*="Console"], [class*="console"], [id*="console"]')) {
+            const t = (container.innerText || '').toUpperCase();
+            for (const kw of keywords) {
+                if (t.includes(kw)) return kw;
+            }
+        }
+
+        return '';
+    }""")
+    return (status or "").upper().strip()
+
+
+def _wait_for_server_status(page, timeout_ms=20000) -> str:
+    """
+    轮询等待服务器状态从 UNKNOWN 变为已知状态。
+    先用 wait_for_selector 等状态关键字出现在 DOM 里，
+    再用 JS 精确读取，避免误匹配导航/按钮文字。
+    """
+    # 先滚动到底部
+    try:
+        page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+        page.wait_for_timeout(800)
+    except Exception:
+        pass
+
+    # 等待状态关键字出现在页面上（最多 timeout_ms）
+    try:
+        page.wait_for_selector(
+            "text=/^(OFFLINE|ONLINE|STARTING|STOPPING|RUNNING)$/i",
+            timeout=timeout_ms,
+        )
+    except Exception:
+        # 选择器匹配不到，改用轮询兜底
+        pass
+
+    # 轮询读取精确状态（最多再等 10s，每 1s 一次）
+    for _ in range(10):
+        status = _read_server_status_js(page)
+        if status in ("OFFLINE", "ONLINE", "STARTING", "STOPPING", "RUNNING"):
+            return status
+        page.wait_for_timeout(1000)
+
+    # 最终兜底：从 body 全文里找（可能误匹配，但总比 UNKNOWN 好）
+    try:
+        body = page.inner_text("body").upper()
+        for kw in ("STARTING", "STOPPING", "RUNNING", "ONLINE", "OFFLINE"):
+            if kw in body:
+                log.warning(f"状态精确读取失败，从 body 全文兜底读到: {kw}（可能误匹配）")
+                return kw
+    except Exception:
+        pass
+
+    return "UNKNOWN"
+
+
 def check_and_start_server(page, server_id: str) -> dict:
     """
     打开 control.optiklink.net/server/{server_id}，读取运行状态；
-    若为 OFFLINE，则定位并点击 START 按钮。
+    若为 OFFLINE，则滚动到 START 按钮并点击。
     """
     result = {"server_id": server_id, "status": "UNKNOWN", "started": False}
     control_url = f"{CONTROL_BASE_URL}/{server_id}"
@@ -1011,17 +1118,9 @@ def check_and_start_server(page, server_id: str) -> dict:
     except Exception as e:
         log.warning(f"打开控制面板超时/异常: {e}")
 
-    # 面板是 React SPA，状态是异步（WebSocket）拉取的，固定 sleep 不够稳
-    # 优先等到状态关键字出现，最多等 8s，等不到再走固定等待兜底
-    try:
-        page.wait_for_selector(
-            "text=/OFFLINE|ONLINE|STARTING|STOPPING/i", timeout=8000
-        )
-    except Exception:
-        page.wait_for_timeout(3000)
-
+    # 页面加载后先等 React 渲染 + WebSocket 推送状态（至多 20s）
+    page.wait_for_timeout(2000)
     close_popups_and_overlays(page)
-    take_screenshot(page, f"06_{server_id}_control")
 
     # 若被重定向离开了这个服务器的详情页，说明面板会话没建立成功
     if server_id not in page.url:
@@ -1030,27 +1129,29 @@ def check_and_start_server(page, server_id: str) -> dict:
             f"控制面板可能未登录成功，无法读取真实状态"
         )
         result["status"] = "NO_ACCESS"
+        take_screenshot(page, f"06_{server_id}_no_access")
         return result
 
-    try:
-        body_text = page.inner_text("body").upper()
-    except Exception as e:
-        log.warning(f"读取控制面板失败: {e}")
-        return result
+    # 用精确 JS 轮询读取状态，避免误匹配导航/按钮文字
+    status = _wait_for_server_status(page, timeout_ms=20000)
+    result["status"] = status
+    log.info(f"服务器 [{server_id}] 当前状态: {status}")
+    take_screenshot(page, f"06_{server_id}_control")
 
-    # 状态关键字优先级：STARTING/STOPPING（过渡态）优先于 ONLINE/OFFLINE 判断更明确
-    for kw in ("STARTING", "STOPPING", "OFFLINE", "ONLINE"):
-        if kw in body_text:
-            result["status"] = kw
-            break
-
-    log.info(f"服务器 [{server_id}] 当前状态: {result['status']}")
-
-    if result["status"] != "OFFLINE":
+    if result["status"] not in ("OFFLINE",):
         log.info(f"服务器 [{server_id}] 无需启动（当前状态: {result['status']}）")
         return result
 
-    log.info(f"服务器 [{server_id}] 离线，尝试点击 START 按钮...")
+    # ── 状态为 OFFLINE，滚动到 START 按钮并点击 ──
+    log.info(f"服务器 [{server_id}] 离线，滚动并尝试点击 START 按钮...")
+
+    # 先滚动到底部确保按钮可见
+    try:
+        page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+        page.wait_for_timeout(800)
+    except Exception:
+        pass
+
     clicked = False
     for sel in [
         'button:has-text("START")',
@@ -1060,6 +1161,9 @@ def check_and_start_server(page, server_id: str) -> dict:
     ]:
         try:
             btn = page.locator(sel).first
+            # scroll_into_view_if_needed 确保按钮进入视口
+            btn.scroll_into_view_if_needed(timeout=3000)
+            page.wait_for_timeout(300)
             if not btn.is_visible(timeout=3000):
                 continue
             if btn.is_disabled():
@@ -1078,18 +1182,19 @@ def check_and_start_server(page, server_id: str) -> dict:
         return result
 
     result["started"] = True
-    page.wait_for_timeout(5000)
-    take_screenshot(page, f"07_{server_id}_after_start")
-
-    # 再读一次状态确认（不强制要求变化，面板可能有延迟）
+    # 等待状态从 OFFLINE 变为 STARTING/ONLINE（最多 10s）
+    page.wait_for_timeout(2000)
     try:
-        body_text_after = page.inner_text("body").upper()
-        for kw in ("STARTING", "ONLINE", "OFFLINE"):
-            if kw in body_text_after:
-                log.info(f"服务器 [{server_id}] 点击 START 后状态: {kw}")
-                break
+        page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+        page.wait_for_timeout(500)
     except Exception:
         pass
+    take_screenshot(page, f"07_{server_id}_after_start")
+
+    # 再读一次状态确认
+    status_after = _wait_for_server_status(page, timeout_ms=8000)
+    if status_after != "UNKNOWN":
+        log.info(f"服务器 [{server_id}] 点击 START 后状态: {status_after}")
 
     return result
 
