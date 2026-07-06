@@ -389,7 +389,6 @@ def close_popups_and_overlays(page):
         const vignetteSelectors = [
             '#google-vignette', '.google-vignette', '[id*="vignette"]',
             '#credential_picker_container', '#credential-picker-container',
-            'div[aria-modal="true"]', '[role="dialog"]',
         ];
         for (const sel of vignetteSelectors) {
             for (const el of document.querySelectorAll(sel)) {
@@ -793,36 +792,42 @@ def get_panel_credentials(page):
 
     take_screenshot(page, "05a_panel_credentials_modal")
 
-    # 直接用 JS 从 DOM 读取 #logintopanel modal 里的账号密码
-    # 不点任何按钮，完全不触碰广告
-    creds = page.evaluate("""() => {
-        const modal = document.querySelector('#logintopanel');
-        if (!modal) return null;
-        const text = modal.innerText || modal.textContent || '';
-
-        // 用户名：可能在普通文本节点里
-        let username = null;
-        const usernameMatch = text.match(/Panel Username[:\\s]*([A-Za-z0-9_\\.\\-]{3,})/i);
-        if (usernameMatch) username = usernameMatch[1].trim();
-
-        // 密码：通常在 id="password" 或 id="pass" 元素，CSS hidden 但文本可读
+    # 根据 DevTools 确认的 HTML 结构：
+    #   <a id="pass">[Click here to view]</a>          ← 可见的"点击查看"链接
+    #   <a id="password" style="display:none"> UmIbEUntFBR </a>  ← 隐藏的真实密码
+    # id="password" 的 textContent 就是真实密码，不需要点任何按钮
+    # 注意：close_popups_and_overlays 会删 role="dialog"，modal DOM 可能已不存在
+    # 所以直接用 getElementById 读取，不依赖 modal 容器
+    creds_raw = page.evaluate("""() => {
+        // 优先从 id="password" 读取真实密码（display:none 但 textContent 可读）
         let password = null;
-        for (const id of ['password', 'pass']) {
-            const el = document.getElementById(id);
-            if (el) {
-                const pw = (el.innerText || el.textContent || '').trim();
-                if (pw.length >= 4) { password = pw; break; }
+        const pwEl = document.getElementById('password');
+        if (pwEl) {
+            const pw = (pwEl.textContent || '').trim();
+            // 排除 "[Click here to view]" 这类占位文本
+            if (pw.length >= 4 && !pw.includes('[') && !pw.toLowerCase().includes('click')) {
+                password = pw;
             }
         }
-        // 兜底：从 modal 文本里正则提取
-        if (!password) {
-            const pwMatch = text.match(/Panel Password[:\\s]*([A-Za-z0-9_\\.\\-]{4,})/i);
-            if (pwMatch) password = pwMatch[1].trim();
-        }
 
-        return (username && password) ? [username, password] : null;
+        // 用户名：从 body textContent 里找（不依赖 modal 是否存在）
+        let username = null;
+        const bodyText = document.body ? (document.body.textContent || '') : '';
+        const m = bodyText.match(/Panel Username[:\s]*([A-Za-z0-9_\.\-]{3,})/i);
+        if (m) username = m[1].trim();
+
+        // 调试信息：返回密码元素是否存在及其原始文本
+        return {
+            username,
+            password,
+            pwElExists: !!pwEl,
+            pwElRaw: pwEl ? (pwEl.textContent || '').trim() : 'N/A'
+        };
     }""")
-
+    log.info(f"[G0a] 密码元素存在: {creds_raw.get('pwElExists')}, 原始文本长度: {len(creds_raw.get('pwElRaw',''))}, 用户名: {creds_raw.get('username')}")
+    username = creds_raw.get('username')
+    password = creds_raw.get('password')
+    creds = (username, password) if (username and password) else None
     if creds:
         log.info(f"✅ 已从 DOM 获取面板账号: {creds[0]}")
         return tuple(creds)
