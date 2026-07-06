@@ -1152,6 +1152,9 @@ def check_and_start_server(page, server_id: str) -> dict:
     except Exception:
         pass
 
+    # 获取当前上下文，用于点击后检测广告新标签页
+    context = page.context
+
     clicked = False
     for sel in [
         'button:has-text("START")',
@@ -1161,7 +1164,6 @@ def check_and_start_server(page, server_id: str) -> dict:
     ]:
         try:
             btn = page.locator(sel).first
-            # scroll_into_view_if_needed 确保按钮进入视口
             btn.scroll_into_view_if_needed(timeout=3000)
             page.wait_for_timeout(300)
             if not btn.is_visible(timeout=3000):
@@ -1169,9 +1171,24 @@ def check_and_start_server(page, server_id: str) -> dict:
             if btn.is_disabled():
                 log.warning(f"START 按钮不可点击（禁用状态）: {sel}")
                 continue
-            btn.click()
+
+            # 用 JS el.click() 直接触发，绕过浮在按钮上方的广告 <a> 层拦截
+            # Playwright .click() 触发鼠标事件，会被透明广告链接截走
+            pages_before = set(id(p) for p in context.pages)
+            btn.evaluate("el => el.click()")
+            page.wait_for_timeout(1500)
+
+            # 关闭点击后广告打开的新标签页
+            for p in list(context.pages):
+                if id(p) not in pages_before and p != page:
+                    log.warning(f"检测到广告新标签页: {p.url}，已关闭")
+                    try:
+                        p.close()
+                    except Exception:
+                        pass
+
             clicked = True
-            log.info(f"已点击 START 按钮: {sel}")
+            log.info(f"已点击 START 按钮（JS）: {sel}")
             break
         except Exception:
             continue
