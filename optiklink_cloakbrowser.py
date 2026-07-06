@@ -79,6 +79,8 @@ WXPUSHER_UID         = os.environ["WXPUSHER_UID"]
 EXPIRE_DATE          = os.environ.get("EXPIRE_DATE", "")
 PROXY_URL            = os.environ.get("PROXY_URL", "socks5://127.0.0.1:10808")
 ENABLE_SCREENRECORD  = os.environ.get("ENABLE_SCREENRECORD",  "false").lower() == "true"
+PANEL_USERNAME       = os.environ.get("PANEL_USERNAME", "")
+PANEL_PASSWORD       = os.environ.get("PANEL_PASSWORD", "")
 
 # v4.8: 新增 —— 登录后自动检测服务器状态，OFFLINE 则自动 START
 # 支持多个服务器 ID，逗号分隔，例如 "90a93db8,abcd1234"
@@ -778,101 +780,20 @@ CONTROL_LOGIN_URL = "https://control.optiklink.net/auth/login"
 
 
 def get_panel_credentials(page):
-    """从 optiklink.net 首页 #logintopanel modal 的 DOM 直接读取面板专用账号密码。
-    Bootstrap modal 内容在页面加载时就写死在 HTML 里，不需要点击触发按钮，
-    直接用 JS 读取即可，彻底避开广告干扰。
+    """从环境变量（GitHub Secrets）读取面板专用账号密码。
+    PANEL_USERNAME / PANEL_PASSWORD 直接配置在 Secrets 里，无需从 DOM 解析。
     """
     log.info("[G0a] 读取面板专用账号密码...")
-    try:
-        page.goto("https://optiklink.net/", timeout=30000, wait_until="domcontentloaded")
-    except Exception as e:
-        log.warning(f"打开主站首页异常: {e}")
-    page.wait_for_timeout(2000)
-    # 注意：这里不调用 close_popups_and_overlays，避免误删 modal DOM 节点
-
     take_screenshot(page, "05a_panel_credentials_modal")
 
-    # 根据 DevTools 确认的 HTML 结构：
-    #   <a id="pass">[Click here to view]</a>          ← 可见的"点击查看"链接
-    #   <a id="password" style="display:none"> UmIbEUntFBR </a>  ← 隐藏的真实密码
-    # id="password" 的 textContent 就是真实密码，不需要点任何按钮
-    # 注意：close_popups_and_overlays 会删 role="dialog"，modal DOM 可能已不存在
-    # 所以直接用 getElementById 读取，不依赖 modal 容器
-    creds_raw = page.evaluate("""() => {
-        // 优先从 id="password" 读取真实密码（display:none 但 textContent 可读）
-        let password = null;
-        const pwEl = document.getElementById('password');
-        if (pwEl) {
-            const pw = (pwEl.textContent || '').trim();
-            // 排除 "[Click here to view]" 这类占位文本
-            if (pw.length >= 4 && !pw.includes('[') && !pw.toLowerCase().includes('click')) {
-                password = pw;
-            }
-        }
-
-        // 用户名：从 body textContent 里找（不依赖 modal 是否存在）
-        let username = null;
-        const bodyText = document.body ? (document.body.textContent || '') : '';
-        const m = bodyText.match(/Panel Username[:\s]*([A-Za-z0-9_\.\-]{3,})/i);
-        if (m) username = m[1].trim();
-
-        // 调试信息：返回密码元素是否存在及其原始文本
-        return {
-            username,
-            password,
-            pwElExists: !!pwEl,
-            pwElRaw: pwEl ? (pwEl.textContent || '').trim() : 'N/A'
-        };
-    }""")
-    log.info(f"[G0a] 密码元素存在: {creds_raw.get('pwElExists')}, 原始文本长度: {len(creds_raw.get('pwElRaw',''))}, 用户名: {creds_raw.get('username')}")
-    username = creds_raw.get('username')
-    password = creds_raw.get('password')
-    creds = (username, password) if (username and password) else None
-    if creds:
-        log.info(f"✅ 已从 DOM 获取面板账号: {creds[0]}")
-        return tuple(creds)
-
-    log.warning("未能从 #logintopanel DOM 提取账号密码，尝试正则兜底...")
-    take_screenshot(page, "05a_panel_credentials_notfound")
-
-    try:
-        html = page.content()
-    except Exception:
-        return None
-
-    username = None
-    password = None
-    for pat in [
-        r'Panel Username\s*:?\s*</strong>\s*([^\s<]{3,})',
-        r'Panel Username[^:]*:\s*([A-Za-z0-9_\.\-]{3,})',
-    ]:
-        m = re.search(pat, html, re.I)
-        if m:
-            username = m.group(1).strip()
-            break
-    for pat in [
-        r'id=["\']pass(?:word)?["\'][^>]*>\s*([A-Za-z0-9_\.\-]{4,})\s*<',
-        r'Panel Password\s*:?\s*</strong>\s*([^\s<]{4,})',
-        r'Panel Password[^:]*:\s*([A-Za-z0-9_\.\-]{4,})',
-    ]:
-        m = re.search(pat, html, re.I)
-        if m:
-            password = m.group(1).strip()
-            break
+    username = PANEL_USERNAME.strip()
+    password = PANEL_PASSWORD.strip()
 
     if username and password:
-        log.info(f"✅ 已从 HTML 正则提取面板账号: {username}")
+        log.info(f"✅ 已从环境变量获取面板账号: {username}，密码长度: {len(password)}")
         return username, password
 
-    log.warning(f"最终未能提取面板账号密码 (username={username!r})")
-    return None
-
-    if username and password:
-        log.info(f"已获取面板账号: {username}")
-        return username, password
-
-    log.warning(f"未能从首页提取面板账号密码 (username={username!r}, password={'已获取' if password else None})")
-    take_screenshot(page, "05a_panel_credentials_notfound")
+    log.warning("环境变量 PANEL_USERNAME / PANEL_PASSWORD 未配置，无法登录控制面板")
     return None
 
 
@@ -901,42 +822,48 @@ def login_control_panel(page) -> bool:
 
     username, password = creds
 
-    filled_user = False
-    for sel in [
-        'input[name="username"]',
-        'input[name="user"]',
-        'input[type="email"]',
-        'input[autocomplete="username"]',
-        'input[id*="user" i]',
-        'input[placeholder*="user" i]',
-        'input[placeholder*="email" i]',
-    ]:
-        try:
-            el = page.locator(sel).first
-            if el.is_visible(timeout=2000):
-                el.fill(username)
-                filled_user = True
-                log.info(f"已填写用户名输入框: {sel}")
-                break
-        except Exception:
-            continue
-
-    if not filled_user:
-        log.warning("未找到面板登录用户名输入框")
+    # 等输入框真正可交互（避免 fill 静默失败）
+    user_sel = 'input[name="username"]'
+    try:
+        page.wait_for_selector(user_sel, state="visible", timeout=10000)
+    except Exception:
+        log.warning("等待用户名输入框超时")
         take_screenshot(page, "05c_login_form_user_notfound")
         return False
 
-    filled_pw = False
-    for sel in ['input[type="password"]', 'input[name="password"]']:
-        try:
-            el = page.locator(sel).first
-            if el.is_visible(timeout=2000):
-                el.fill(password)
-                filled_pw = True
-                log.info(f"已填写密码输入框: {sel}")
-                break
-        except Exception:
-            continue
+    # 用 click + type 代替 fill，更接近真实用户操作，避免框架拦截
+    try:
+        el = page.locator(user_sel).first
+        el.click()
+        page.wait_for_timeout(300)
+        el.fill("")  # 先清空
+        page.keyboard.type(username, delay=80)
+        actual = el.input_value()
+        log.info(f"已填写用户名输入框，实际值长度: {len(actual)}")
+        filled_user = len(actual) > 0
+    except Exception as e:
+        log.warning(f"填写用户名失败: {e}")
+        filled_user = False
+
+    if not filled_user:
+        log.warning("用户名未能填入输入框")
+        take_screenshot(page, "05c_login_form_user_notfound")
+        return False
+
+    pw_sel = 'input[type="password"]'
+    try:
+        page.wait_for_selector(pw_sel, state="visible", timeout=5000)
+        el_pw = page.locator(pw_sel).first
+        el_pw.click()
+        page.wait_for_timeout(300)
+        el_pw.fill("")
+        page.keyboard.type(password, delay=80)
+        actual_pw = el_pw.input_value()
+        log.info(f"已填写密码输入框，实际值长度: {len(actual_pw)}")
+        filled_pw = len(actual_pw) > 0
+    except Exception as e:
+        log.warning(f"填写密码失败: {e}")
+        filled_pw = False
 
     if not filled_pw:
         log.warning("未找到面板登录密码输入框")
