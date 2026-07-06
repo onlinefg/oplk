@@ -1,6 +1,14 @@
 """
-OptikLink 每日自动登录脚本 v4.10 (CloakBrowser版)
+OptikLink 每日自动登录脚本 v4.11 (CloakBrowser版)
 原理：用 CloakBrowser 打开页面，注入 Discord Token 完成 OAuth2 授权
+
+新增记录 v4.11:
+  - 【修复】"Login to Panel" 点到广告了。原因：a:has-text("Login to Panel") 选择器
+    会匹配到广告链接，而真正的触发按钮是 Bootstrap modal 链接，
+    HTML 为 <a data-toggle="modal" data-target="#logintopanel">
+    改为精确匹配 [data-target="#logintopanel"] 属性，彻底避开广告
+  - 密码读取改用 JS evaluate 直接访问 document.getElementById('password'/'pass')
+    的 innerText，不受 is_visible 限制，CSS hidden 元素也能正常读取
 
 新增记录 v4.10:
   - 【修复】上一版误判 control.optiklink.net/auth/login 为 SSO 自动跳转地址，
@@ -780,21 +788,28 @@ def get_panel_credentials(page):
     page.wait_for_timeout(2000)
     close_popups_and_overlays(page)
 
-    # 弹窗可能需要点一下侧边栏 "Login to Panel" 才会出现
+    # "Login to Panel" 是 Bootstrap modal 触发链接，data-target="#logintopanel"
+    # 不能用 a:has-text("Login to Panel")——会命中广告链接
+    # 必须精确匹配 data-target="#logintopanel" 属性
+    triggered = False
     for sel in [
-        'a:has-text("Login to Panel")',
-        'text="Login to Panel"',
-        'li:has-text("Login to Panel")',
+        'a[data-target="#logintopanel"]',
+        '[data-target="#logintopanel"]',
+        'a[href="#logintopanel"]',
     ]:
         try:
             el = page.locator(sel).first
             if el.is_visible(timeout=2000):
                 el.click()
                 log.info(f"已点击唤出面板凭据弹窗: {sel}")
-                page.wait_for_timeout(1500)
+                page.wait_for_timeout(2000)
+                triggered = True
                 break
         except Exception:
             continue
+
+    if not triggered:
+        log.warning("未找到 #logintopanel 触发按钮，尝试直接读取 modal 内容（可能已预渲染）")
 
     take_screenshot(page, "05a_panel_credentials_modal")
 
@@ -807,6 +822,7 @@ def get_panel_credentials(page):
     username = None
     password = None
 
+    # 用户名：<strong>Your Panel Username:</strong> willpbji
     for pat in [
         r'Panel Username\s*:?\s*</strong>\s*([^\s<]+)',
         r'Your\s+Panel\s+Username\s*:?\s*</strong>\s*([^\s<]+)',
@@ -817,17 +833,24 @@ def get_panel_credentials(page):
             username = m.group(1).strip()
             break
 
-    # 密码通常在 id="password" 元素文本里（即使被 CSS 隐藏，文本内容仍可读取）
+    # 密码：<a id="password" style="display:none">UmIbEUntFBR</a>（hidden but text readable）
+    # 也可能是 <a id="pass" ...> 格式，优先用 JS 读取避免 is_visible 限制
     try:
-        pw_el = page.locator("#password").first
-        if pw_el.count() > 0:
-            password = pw_el.inner_text(timeout=2000).strip()
+        password = page.evaluate("""() => {
+            for (const id of ['password', 'pass']) {
+                const el = document.getElementById(id);
+                if (el) return (el.innerText || el.textContent || '').trim();
+            }
+            return null;
+        }""")
     except Exception:
         pass
+
     if not password:
         for pat in [
             r'Panel Password\s*:?\s*</strong>\s*([^\s<]+)',
             r'Panel Password[^:]*:\s*([A-Za-z0-9_\.\-]{3,})',
+            r'id=["\']pass(?:word)?["\'][^>]*>([A-Za-z0-9_\.\-]{3,})<',
         ]:
             m = re.search(pat, html, re.I)
             if m:
@@ -1127,7 +1150,7 @@ def build_message(info: dict, server_results: list | None = None) -> tuple[str, 
 # ─────────────────────────────────────────────────────────────
 def main():
     log.info("=" * 55)
-    log.info("  OptikLink 自动登录脚本 v4.10 (CloakBrowser)")
+    log.info("  OptikLink 自动登录脚本 v4.11 (CloakBrowser)")
     log.info("=" * 55)
     log.info(f"  截图: 始终开启  |  录屏: {'开启' if ENABLE_SCREENRECORD else '关闭'}")
 
