@@ -1,6 +1,11 @@
 """
-OptikLink 每日自动登录脚本 v4.6 (CloakBrowser版)
+OptikLink 每日自动登录脚本 v4.8 (CloakBrowser版)
 原理：用 CloakBrowser 打开页面，注入 Discord Token 完成 OAuth2 授权
+
+新增记录 v4.8:
+  - 【新功能】登录成功后自动跳转 control.optiklink.net/server/{ID} 检测服务器运行状态
+    若为 OFFLINE，自动点击 START 按钮启动；支持通过 SERVER_IDS（逗号分隔）配置多台服务器
+  - 推送消息新增"服务器状态"表格，展示每台服务器的检测结果与是否已自动启动
 
 修复记录 v4.6:
   - 【录屏修复】抛弃 scrot/import 逐帧截屏方案（黑屏问题）
@@ -53,9 +58,17 @@ EXPIRE_DATE          = os.environ.get("EXPIRE_DATE", "")
 PROXY_URL            = os.environ.get("PROXY_URL", "socks5://127.0.0.1:10808")
 ENABLE_SCREENRECORD  = os.environ.get("ENABLE_SCREENRECORD",  "false").lower() == "true"
 
+# v4.8: 新增 —— 登录后自动检测服务器状态，OFFLINE 则自动 START
+# 支持多个服务器 ID，逗号分隔，例如 "90a93db8,abcd1234"
+# 完全从环境变量 SERVER_IDS 读取（GitHub Secrets 未配置或为空时，此处兜底默认值仅用于本地调试）
+SERVER_IDS = [
+    s.strip() for s in (os.environ.get("SERVER_IDS") or "90a93db8").split(",") if s.strip()
+]
+
 BASE_URL      = "https://optiklink.net"
 AUTH_URL      = f"{BASE_URL}/auth"
 DASHBOARD_URL = BASE_URL
+CONTROL_BASE_URL = "https://control.optiklink.net/server"
 
 VIEWPORT_W = 1280
 VIEWPORT_H = 754  # 必须为偶数，h264 编码器要求宽高均可被 2 整除（原 753 奇数导致录屏 0 字节）
@@ -733,9 +746,102 @@ def read_dashboard(page) -> dict:
     return info
 
 # ─────────────────────────────────────────────────────────────
+# v4.8: 检测服务器状态，OFFLINE 则自动点击 START
+# ─────────────────────────────────────────────────────────────
+def check_and_start_server(page, server_id: str) -> dict:
+    """
+    打开 control.optiklink.net/server/{server_id}，读取运行状态；
+    若为 OFFLINE，则定位并点击 START 按钮。
+    """
+    result = {"server_id": server_id, "status": "UNKNOWN", "started": False}
+    control_url = f"{CONTROL_BASE_URL}/{server_id}"
+
+    log.info(f"[G] 检测服务器状态: {control_url}")
+    try:
+        page.goto(control_url, timeout=30000, wait_until="domcontentloaded")
+    except Exception as e:
+        log.warning(f"打开控制面板超时/异常: {e}")
+
+    page.wait_for_timeout(3500)
+    close_popups_and_overlays(page)
+    take_screenshot(page, f"06_{server_id}_control")
+
+    try:
+        body_text = page.inner_text("body").upper()
+    except Exception as e:
+        log.warning(f"读取控制面板失败: {e}")
+        return result
+
+    # 状态关键字优先级：STARTING/STOPPING（过渡态）优先于 ONLINE/OFFLINE 判断更明确
+    for kw in ("STARTING", "STOPPING", "OFFLINE", "ONLINE"):
+        if kw in body_text:
+            result["status"] = kw
+            break
+
+    log.info(f"服务器 [{server_id}] 当前状态: {result['status']}")
+
+    if result["status"] != "OFFLINE":
+        log.info(f"服务器 [{server_id}] 无需启动（当前状态: {result['status']}）")
+        return result
+
+    log.info(f"服务器 [{server_id}] 离线，尝试点击 START 按钮...")
+    clicked = False
+    for sel in [
+        'button:has-text("START")',
+        'button:has-text("Start")',
+        'button:has-text("启动")',
+        'button:has-text("start")',
+    ]:
+        try:
+            btn = page.locator(sel).first
+            if not btn.is_visible(timeout=3000):
+                continue
+            if btn.is_disabled():
+                log.warning(f"START 按钮不可点击（禁用状态）: {sel}")
+                continue
+            btn.click()
+            clicked = True
+            log.info(f"已点击 START 按钮: {sel}")
+            break
+        except Exception:
+            continue
+
+    if not clicked:
+        log.warning(f"服务器 [{server_id}] 未找到可点击的 START 按钮")
+        take_screenshot(page, f"06_{server_id}_start_notfound")
+        return result
+
+    result["started"] = True
+    page.wait_for_timeout(5000)
+    take_screenshot(page, f"07_{server_id}_after_start")
+
+    # 再读一次状态确认（不强制要求变化，面板可能有延迟）
+    try:
+        body_text_after = page.inner_text("body").upper()
+        for kw in ("STARTING", "ONLINE", "OFFLINE"):
+            if kw in body_text_after:
+                log.info(f"服务器 [{server_id}] 点击 START 后状态: {kw}")
+                break
+    except Exception:
+        pass
+
+    return result
+
+
+def check_and_start_all_servers(page) -> list:
+    results = []
+    for sid in SERVER_IDS:
+        try:
+            results.append(check_and_start_server(page, sid))
+        except Exception as e:
+            log.error(f"检测服务器 [{sid}] 异常: {e}")
+            results.append({"server_id": sid, "status": "ERROR", "started": False})
+    return results
+
+# ─────────────────────────────────────────────────────────────
 # 构建推送消息
 # ─────────────────────────────────────────────────────────────
-def build_message(info: dict) -> tuple[str, str]:
+def build_message(info: dict, server_results: list | None = None) -> tuple[str, str]:
     now_utc = datetime.now(timezone.utc)
     status = "✅ 登录成功" if info["logged_in"] else "❌ 登录失败"
 
@@ -760,6 +866,23 @@ def build_message(info: dict) -> tuple[str, str]:
         warning = f"\n\n> 📅 服务到期还剩 **{days_left}** 天" if 0 < days_left <= 30 else ""
         title = f"OptikLink 签到 | {status}"
 
+    server_lines = ""
+    if server_results:
+        rows = []
+        for r in server_results:
+            if r["status"] == "OFFLINE" and r["started"]:
+                s = "🟢 已自动启动"
+            elif r["status"] == "OFFLINE" and not r["started"]:
+                s = "🔴 离线，启动失败/未找到按钮"
+            elif r["status"] == "ONLINE":
+                s = "🟢 在线"
+            elif r["status"] in ("STARTING", "STOPPING"):
+                s = f"🟡 {r['status']}"
+            else:
+                s = f"⚪ {r['status']}"
+            rows.append(f"| {r['server_id']} | {s} |")
+        server_lines = "\n\n### 服务器状态\n\n| 服务器 | 状态 |\n|------|------|\n" + "\n".join(rows)
+
     content = f"""## OptikLink 每日自动登录报告
 
 | 项目 | 内容 |
@@ -770,7 +893,7 @@ def build_message(info: dict) -> tuple[str, str]:
 | 服务到期 | {info['expire_date'] or '未知'} |
 | 剩余天数 | {days_left if days_left >= 0 else '未知'} 天 |
 | 执行时间 | {now_utc.strftime('%Y-%m-%d %H:%M:%S')} UTC |
-{warning}
+{warning}{server_lines}
 """
     return title, content
 
@@ -779,7 +902,7 @@ def build_message(info: dict) -> tuple[str, str]:
 # ─────────────────────────────────────────────────────────────
 def main():
     log.info("=" * 55)
-    log.info("  OptikLink 自动登录脚本 v4.6 (CloakBrowser)")
+    log.info("  OptikLink 自动登录脚本 v4.8 (CloakBrowser)")
     log.info("=" * 55)
     log.info(f"  截图: 始终开启  |  录屏: {'开启' if ENABLE_SCREENRECORD else '关闭'}")
 
@@ -816,7 +939,11 @@ def main():
             sys.exit(1)
 
         info = read_dashboard(page)
-        title, content = build_message(info)
+
+        # v4.8: 登录成功后检测服务器状态，OFFLINE 则自动启动
+        server_results = check_and_start_all_servers(page)
+
+        title, content = build_message(info, server_results)
         wxpush(title, content)
 
         if not info["logged_in"]:
