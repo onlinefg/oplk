@@ -779,83 +779,88 @@ CONTROL_LOGIN_URL = "https://control.optiklink.net/auth/login"
 
 
 def get_panel_credentials(page):
-    """从 optiklink.net 首页 'Login to Panel' 弹窗里读取面板专用账号密码"""
+    """从 optiklink.net 首页 #logintopanel modal 的 DOM 直接读取面板专用账号密码。
+    Bootstrap modal 内容在页面加载时就写死在 HTML 里，不需要点击触发按钮，
+    直接用 JS 读取即可，彻底避开广告干扰。
+    """
     log.info("[G0a] 读取面板专用账号密码...")
     try:
         page.goto("https://optiklink.net/", timeout=30000, wait_until="domcontentloaded")
     except Exception as e:
         log.warning(f"打开主站首页异常: {e}")
     page.wait_for_timeout(2000)
-    close_popups_and_overlays(page)
-
-    # "Login to Panel" 是 Bootstrap modal 触发链接，data-target="#logintopanel"
-    # 不能用 a:has-text("Login to Panel")——会命中广告链接
-    # 必须精确匹配 data-target="#logintopanel" 属性
-    triggered = False
-    for sel in [
-        'a[data-target="#logintopanel"]',
-        '[data-target="#logintopanel"]',
-        'a[href="#logintopanel"]',
-    ]:
-        try:
-            el = page.locator(sel).first
-            if el.is_visible(timeout=2000):
-                el.click()
-                log.info(f"已点击唤出面板凭据弹窗: {sel}")
-                page.wait_for_timeout(2000)
-                triggered = True
-                break
-        except Exception:
-            continue
-
-    if not triggered:
-        log.warning("未找到 #logintopanel 触发按钮，尝试直接读取 modal 内容（可能已预渲染）")
+    # 注意：这里不调用 close_popups_and_overlays，避免误删 modal DOM 节点
 
     take_screenshot(page, "05a_panel_credentials_modal")
 
+    # 直接用 JS 从 DOM 读取 #logintopanel modal 里的账号密码
+    # 不点任何按钮，完全不触碰广告
+    creds = page.evaluate("""() => {
+        const modal = document.querySelector('#logintopanel');
+        if (!modal) return null;
+        const text = modal.innerText || modal.textContent || '';
+
+        // 用户名：可能在普通文本节点里
+        let username = null;
+        const usernameMatch = text.match(/Panel Username[:\\s]*([A-Za-z0-9_\\.\\-]{3,})/i);
+        if (usernameMatch) username = usernameMatch[1].trim();
+
+        // 密码：通常在 id="password" 或 id="pass" 元素，CSS hidden 但文本可读
+        let password = null;
+        for (const id of ['password', 'pass']) {
+            const el = document.getElementById(id);
+            if (el) {
+                const pw = (el.innerText || el.textContent || '').trim();
+                if (pw.length >= 4) { password = pw; break; }
+            }
+        }
+        // 兜底：从 modal 文本里正则提取
+        if (!password) {
+            const pwMatch = text.match(/Panel Password[:\\s]*([A-Za-z0-9_\\.\\-]{4,})/i);
+            if (pwMatch) password = pwMatch[1].trim();
+        }
+
+        return (username && password) ? [username, password] : null;
+    }""")
+
+    if creds:
+        log.info(f"✅ 已从 DOM 获取面板账号: {creds[0]}")
+        return tuple(creds)
+
+    log.warning("未能从 #logintopanel DOM 提取账号密码，尝试正则兜底...")
+    take_screenshot(page, "05a_panel_credentials_notfound")
+
     try:
         html = page.content()
-    except Exception as e:
-        log.warning(f"读取首页内容失败: {e}")
+    except Exception:
         return None
 
     username = None
     password = None
-
-    # 用户名：<strong>Your Panel Username:</strong> willpbji
     for pat in [
-        r'Panel Username\s*:?\s*</strong>\s*([^\s<]+)',
-        r'Your\s+Panel\s+Username\s*:?\s*</strong>\s*([^\s<]+)',
+        r'Panel Username\s*:?\s*</strong>\s*([^\s<]{3,})',
         r'Panel Username[^:]*:\s*([A-Za-z0-9_\.\-]{3,})',
     ]:
         m = re.search(pat, html, re.I)
         if m:
             username = m.group(1).strip()
             break
+    for pat in [
+        r'id=["\']pass(?:word)?["\'][^>]*>\s*([A-Za-z0-9_\.\-]{4,})\s*<',
+        r'Panel Password\s*:?\s*</strong>\s*([^\s<]{4,})',
+        r'Panel Password[^:]*:\s*([A-Za-z0-9_\.\-]{4,})',
+    ]:
+        m = re.search(pat, html, re.I)
+        if m:
+            password = m.group(1).strip()
+            break
 
-    # 密码：<a id="password" style="display:none">UmIbEUntFBR</a>（hidden but text readable）
-    # 也可能是 <a id="pass" ...> 格式，优先用 JS 读取避免 is_visible 限制
-    try:
-        password = page.evaluate("""() => {
-            for (const id of ['password', 'pass']) {
-                const el = document.getElementById(id);
-                if (el) return (el.innerText || el.textContent || '').trim();
-            }
-            return null;
-        }""")
-    except Exception:
-        pass
+    if username and password:
+        log.info(f"✅ 已从 HTML 正则提取面板账号: {username}")
+        return username, password
 
-    if not password:
-        for pat in [
-            r'Panel Password\s*:?\s*</strong>\s*([^\s<]+)',
-            r'Panel Password[^:]*:\s*([A-Za-z0-9_\.\-]{3,})',
-            r'id=["\']pass(?:word)?["\'][^>]*>([A-Za-z0-9_\.\-]{3,})<',
-        ]:
-            m = re.search(pat, html, re.I)
-            if m:
-                password = m.group(1).strip()
-                break
+    log.warning(f"最终未能提取面板账号密码 (username={username!r})")
+    return None
 
     if username and password:
         log.info(f"已获取面板账号: {username}")
