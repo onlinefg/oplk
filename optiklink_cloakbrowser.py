@@ -1037,13 +1037,17 @@ def _read_server_status_js(page) -> str:
             }
         }
 
-        // 方法2：遍历所有小型文字元素（span/div/p），精确匹配状态关键字
-        // 避免匹配到按钮文字（START/STOP 等）
+        // 方法2：遍历所有小型文字元素（span/div/p），匹配状态关键字
+        // 状态文字可能带附加信息，如 "RUNNING (0h 0m 3s)"，用 startsWith 匹配
+        // 避免匹配到按钮文字（START/STOP/RESTART 等）
+        const btnWords = ['START', 'STOP', 'RESTART', 'KILL', 'SEND'];
         for (const el of document.querySelectorAll('span, p, small, [class*="badge"], [class*="pill"], [class*="tag"], [class*="chip"]')) {
             const t = (el.innerText || el.textContent || '').trim().toUpperCase();
-            // 精确匹配：文字本身就是状态词，或状态词后接空格
+            // 跳过纯按钮文字
+            if (btnWords.includes(t)) continue;
             for (const kw of keywords) {
-                if (t === kw) return kw;
+                // 精确匹配 或 "RUNNING (0h 0m 3s)" 这类带附加信息的形式
+                if (t === kw || t.startsWith(kw + ' ') || t.startsWith(kw + '(')) return kw;
             }
         }
 
