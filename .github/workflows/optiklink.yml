@@ -76,6 +76,8 @@ jobs:
           # 控制面板专用账号密码（control.optiklink.net），从主站"Login to Panel"弹窗里获取
           PANEL_USERNAME:      ${{ secrets.PANEL_USERNAME }}
           PANEL_PASSWORD:      ${{ secrets.PANEL_PASSWORD }}
+          # remember_me cookie（有效期5年），免密登录控制面板，彻底绕过 reCAPTCHA
+          PANEL_REMEMBER_COOKIE: ${{ secrets.PANEL_REMEMBER_COOKIE }}
           PROXY_URL:           "socks5://127.0.0.1:10808"
           # 定时触发时 input 为空，默认不录屏
           ENABLE_SCREENRECORD: ${{ github.event.inputs.enable_recording || 'false' }}
