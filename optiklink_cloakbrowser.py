@@ -1,6 +1,14 @@
 """
-OptikLink 每日自动登录脚本 v4.8 (CloakBrowser版)
+OptikLink 每日自动登录脚本 v4.9 (CloakBrowser版)
 原理：用 CloakBrowser 打开页面，注入 Discord Token 完成 OAuth2 授权
+
+新增记录 v4.9:
+  - 【修复】control.optiklink.net 是独立面板系统，需要单独 SSO 登录才有会话
+    新增 login_control_panel()：先访问 control.optiklink.net/auth/login 建立面板会话，
+    再进入 /server/{id} 检测状态，否则页面拿不到真实状态，只会读到 UNKNOWN
+  - 状态检测改为等待 OFFLINE/ONLINE/STARTING/STOPPING 关键字出现（最多 8s），
+    不再依赖固定 sleep，应对面板异步 WebSocket 拉取状态的情况
+  - 新增 NO_ACCESS 状态：若打开 /server/{id} 后被重定向离开，说明面板会话未建立成功
 
 新增记录 v4.8:
   - 【新功能】登录成功后自动跳转 control.optiklink.net/server/{ID} 检测服务器运行状态
@@ -746,6 +754,34 @@ def read_dashboard(page) -> dict:
     return info
 
 # ─────────────────────────────────────────────────────────────
+# v4.9: control.optiklink.net 是独立面板系统，需要单独 SSO 登录
+# 主站首页 "Login to Panel" 弹窗里的 "Panel Login" 按钮，href 固定为
+# https://control.optiklink.net/auth/login —— 依赖主站已登录的会话完成
+# 跨子域握手。必须先访问这个地址建立面板会话，否则直接打开
+# /server/{id} 面板拿不到会话，状态检测不到 OFFLINE/ONLINE，只会是 UNKNOWN。
+# ─────────────────────────────────────────────────────────────
+CONTROL_LOGIN_URL = "https://control.optiklink.net/auth/login"
+
+def login_control_panel(page) -> bool:
+    log.info("[G0] 登录控制面板 (control.optiklink.net SSO)...")
+    try:
+        page.goto(CONTROL_LOGIN_URL, timeout=30000, wait_until="domcontentloaded")
+    except Exception as e:
+        log.warning(f"打开控制面板登录页异常: {e}")
+
+    page.wait_for_timeout(4000)
+    close_popups_and_overlays(page)
+    take_screenshot(page, "05b_control_panel_login")
+
+    current = page.url.lower()
+    ok = "control.optiklink.net" in current and "/auth/login" not in current
+    if ok:
+        log.info(f"✅ 控制面板已登录: {page.url}")
+    else:
+        log.warning(f"⚠️ 控制面板登录状态未知，当前URL: {page.url}（后续检测可能拿不到真实状态）")
+    return ok
+
+# ─────────────────────────────────────────────────────────────
 # v4.8: 检测服务器状态，OFFLINE 则自动点击 START
 # ─────────────────────────────────────────────────────────────
 def check_and_start_server(page, server_id: str) -> dict:
@@ -762,9 +798,26 @@ def check_and_start_server(page, server_id: str) -> dict:
     except Exception as e:
         log.warning(f"打开控制面板超时/异常: {e}")
 
-    page.wait_for_timeout(3500)
+    # 面板是 React SPA，状态是异步（WebSocket）拉取的，固定 sleep 不够稳
+    # 优先等到状态关键字出现，最多等 8s，等不到再走固定等待兜底
+    try:
+        page.wait_for_selector(
+            "text=/OFFLINE|ONLINE|STARTING|STOPPING/i", timeout=8000
+        )
+    except Exception:
+        page.wait_for_timeout(3000)
+
     close_popups_and_overlays(page)
     take_screenshot(page, f"06_{server_id}_control")
+
+    # 若被重定向离开了这个服务器的详情页，说明面板会话没建立成功
+    if server_id not in page.url:
+        log.warning(
+            f"服务器 [{server_id}] 页面被重定向到 {page.url}，"
+            f"控制面板可能未登录成功，无法读取真实状态"
+        )
+        result["status"] = "NO_ACCESS"
+        return result
 
     try:
         body_text = page.inner_text("body").upper()
@@ -829,6 +882,7 @@ def check_and_start_server(page, server_id: str) -> dict:
 
 
 def check_and_start_all_servers(page) -> list:
+    login_control_panel(page)
     results = []
     for sid in SERVER_IDS:
         try:
@@ -878,6 +932,8 @@ def build_message(info: dict, server_results: list | None = None) -> tuple[str, 
                 s = "🟢 在线"
             elif r["status"] in ("STARTING", "STOPPING"):
                 s = f"🟡 {r['status']}"
+            elif r["status"] == "NO_ACCESS":
+                s = "⚠️ 控制面板未登录成功，无法读取状态"
             else:
                 s = f"⚪ {r['status']}"
             rows.append(f"| {r['server_id']} | {s} |")
@@ -902,7 +958,7 @@ def build_message(info: dict, server_results: list | None = None) -> tuple[str, 
 # ─────────────────────────────────────────────────────────────
 def main():
     log.info("=" * 55)
-    log.info("  OptikLink 自动登录脚本 v4.8 (CloakBrowser)")
+    log.info("  OptikLink 自动登录脚本 v4.9 (CloakBrowser)")
     log.info("=" * 55)
     log.info(f"  截图: 始终开启  |  录屏: {'开启' if ENABLE_SCREENRECORD else '关闭'}")
 
