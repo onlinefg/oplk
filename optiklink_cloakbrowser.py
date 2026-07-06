@@ -1,6 +1,12 @@
 """
-OptikLink 每日自动登录脚本 v4.9 (CloakBrowser版)
+OptikLink 每日自动登录脚本 v4.10 (CloakBrowser版)
 原理：用 CloakBrowser 打开页面，注入 Discord Token 完成 OAuth2 授权
+
+新增记录 v4.10:
+  - 【修复】上一版误判 control.optiklink.net/auth/login 为 SSO 自动跳转地址，
+    实测它是一个真正的登录表单页。改为：先在 optiklink.net 首页
+    "Login to Panel" 弹窗里读取专用的面板账号密码，再到面板登录页填表单提交
+  - 新增 get_panel_credentials()：从首页弹窗解析 Panel Username / Panel Password
 
 新增记录 v4.9:
   - 【修复】control.optiklink.net 是独立面板系统，需要单独 SSO 登录才有会话
@@ -754,31 +760,194 @@ def read_dashboard(page) -> dict:
     return info
 
 # ─────────────────────────────────────────────────────────────
-# v4.9: control.optiklink.net 是独立面板系统，需要单独 SSO 登录
-# 主站首页 "Login to Panel" 弹窗里的 "Panel Login" 按钮，href 固定为
-# https://control.optiklink.net/auth/login —— 依赖主站已登录的会话完成
-# 跨子域握手。必须先访问这个地址建立面板会话，否则直接打开
-# /server/{id} 面板拿不到会话，状态检测不到 OFFLINE/ONLINE，只会是 UNKNOWN。
+# v4.10: control.optiklink.net/auth/login 实际是一个真正的登录表单页
+# （不是自动 SSO 跳转）。需要的账号密码就是主站首页 "Login to Panel"
+# 弹窗里展示的那组专用面板账号：
+#   Your Panel Username: xxxxx
+#   Your Panel Password: xxxxx
+# 流程：先在主站首页读出这组账号密码 → 打开面板登录页 → 填表单提交
 # ─────────────────────────────────────────────────────────────
 CONTROL_LOGIN_URL = "https://control.optiklink.net/auth/login"
 
+
+def get_panel_credentials(page):
+    """从 optiklink.net 首页 'Login to Panel' 弹窗里读取面板专用账号密码"""
+    log.info("[G0a] 读取面板专用账号密码...")
+    try:
+        page.goto("https://optiklink.net/", timeout=30000, wait_until="domcontentloaded")
+    except Exception as e:
+        log.warning(f"打开主站首页异常: {e}")
+    page.wait_for_timeout(2000)
+    close_popups_and_overlays(page)
+
+    # 弹窗可能需要点一下侧边栏 "Login to Panel" 才会出现
+    for sel in [
+        'a:has-text("Login to Panel")',
+        'text="Login to Panel"',
+        'li:has-text("Login to Panel")',
+    ]:
+        try:
+            el = page.locator(sel).first
+            if el.is_visible(timeout=2000):
+                el.click()
+                log.info(f"已点击唤出面板凭据弹窗: {sel}")
+                page.wait_for_timeout(1500)
+                break
+        except Exception:
+            continue
+
+    take_screenshot(page, "05a_panel_credentials_modal")
+
+    try:
+        html = page.content()
+    except Exception as e:
+        log.warning(f"读取首页内容失败: {e}")
+        return None
+
+    username = None
+    password = None
+
+    for pat in [
+        r'Panel Username\s*:?\s*</strong>\s*([^\s<]+)',
+        r'Your\s+Panel\s+Username\s*:?\s*</strong>\s*([^\s<]+)',
+        r'Panel Username[^:]*:\s*([A-Za-z0-9_\.\-]{3,})',
+    ]:
+        m = re.search(pat, html, re.I)
+        if m:
+            username = m.group(1).strip()
+            break
+
+    # 密码通常在 id="password" 元素文本里（即使被 CSS 隐藏，文本内容仍可读取）
+    try:
+        pw_el = page.locator("#password").first
+        if pw_el.count() > 0:
+            password = pw_el.inner_text(timeout=2000).strip()
+    except Exception:
+        pass
+    if not password:
+        for pat in [
+            r'Panel Password\s*:?\s*</strong>\s*([^\s<]+)',
+            r'Panel Password[^:]*:\s*([A-Za-z0-9_\.\-]{3,})',
+        ]:
+            m = re.search(pat, html, re.I)
+            if m:
+                password = m.group(1).strip()
+                break
+
+    if username and password:
+        log.info(f"已获取面板账号: {username}")
+        return username, password
+
+    log.warning(f"未能从首页提取面板账号密码 (username={username!r}, password={'已获取' if password else None})")
+    take_screenshot(page, "05a_panel_credentials_notfound")
+    return None
+
+
 def login_control_panel(page) -> bool:
-    log.info("[G0] 登录控制面板 (control.optiklink.net SSO)...")
+    """打开 control.optiklink.net/auth/login 登录表单，用面板专用账号密码登录"""
+    log.info("[G0] 登录控制面板 (control.optiklink.net)...")
+
+    creds = get_panel_credentials(page)
+
     try:
         page.goto(CONTROL_LOGIN_URL, timeout=30000, wait_until="domcontentloaded")
     except Exception as e:
         log.warning(f"打开控制面板登录页异常: {e}")
+    page.wait_for_timeout(2500)
+    close_popups_and_overlays(page)
+    take_screenshot(page, "05b_control_panel_login_page")
+
+    current = page.url.lower()
+    if "control.optiklink.net" in current and "/auth/login" not in current:
+        log.info(f"✅ 已处于登录状态: {page.url}")
+        return True
+
+    if not creds:
+        log.warning("没有可用的面板账号密码，无法自动登录控制面板")
+        return False
+
+    username, password = creds
+
+    filled_user = False
+    for sel in [
+        'input[name="username"]',
+        'input[name="user"]',
+        'input[type="email"]',
+        'input[autocomplete="username"]',
+        'input[id*="user" i]',
+        'input[placeholder*="user" i]',
+        'input[placeholder*="email" i]',
+    ]:
+        try:
+            el = page.locator(sel).first
+            if el.is_visible(timeout=2000):
+                el.fill(username)
+                filled_user = True
+                log.info(f"已填写用户名输入框: {sel}")
+                break
+        except Exception:
+            continue
+
+    if not filled_user:
+        log.warning("未找到面板登录用户名输入框")
+        take_screenshot(page, "05c_login_form_user_notfound")
+        return False
+
+    filled_pw = False
+    for sel in ['input[type="password"]', 'input[name="password"]']:
+        try:
+            el = page.locator(sel).first
+            if el.is_visible(timeout=2000):
+                el.fill(password)
+                filled_pw = True
+                log.info(f"已填写密码输入框: {sel}")
+                break
+        except Exception:
+            continue
+
+    if not filled_pw:
+        log.warning("未找到面板登录密码输入框")
+        take_screenshot(page, "05c_login_form_pw_notfound")
+        return False
+
+    take_screenshot(page, "05c_login_form_filled")
+
+    submitted = False
+    for sel in [
+        'button[type="submit"]',
+        'button:has-text("Login")',
+        'button:has-text("Sign in")',
+        'button:has-text("登录")',
+        'input[type="submit"]',
+    ]:
+        try:
+            btn = page.locator(sel).first
+            if btn.is_visible(timeout=2000):
+                btn.click()
+                submitted = True
+                log.info(f"已提交面板登录表单: {sel}")
+                break
+        except Exception:
+            continue
+
+    if not submitted:
+        # 兜底：直接在密码框回车提交
+        try:
+            page.locator('input[type="password"]').first.press("Enter")
+            submitted = True
+            log.info("未找到登录按钮，改为在密码框按 Enter 提交")
+        except Exception:
+            pass
 
     page.wait_for_timeout(4000)
-    close_popups_and_overlays(page)
-    take_screenshot(page, "05b_control_panel_login")
+    take_screenshot(page, "05d_after_panel_login_submit")
 
     current = page.url.lower()
     ok = "control.optiklink.net" in current and "/auth/login" not in current
     if ok:
-        log.info(f"✅ 控制面板已登录: {page.url}")
+        log.info(f"✅ 控制面板登录成功: {page.url}")
     else:
-        log.warning(f"⚠️ 控制面板登录状态未知，当前URL: {page.url}（后续检测可能拿不到真实状态）")
+        log.warning(f"⚠️ 控制面板登录仍然失败，当前URL: {page.url}")
     return ok
 
 # ─────────────────────────────────────────────────────────────
@@ -958,7 +1127,7 @@ def build_message(info: dict, server_results: list | None = None) -> tuple[str, 
 # ─────────────────────────────────────────────────────────────
 def main():
     log.info("=" * 55)
-    log.info("  OptikLink 自动登录脚本 v4.9 (CloakBrowser)")
+    log.info("  OptikLink 自动登录脚本 v4.10 (CloakBrowser)")
     log.info("=" * 55)
     log.info(f"  截图: 始终开启  |  录屏: {'开启' if ENABLE_SCREENRECORD else '关闭'}")
 
